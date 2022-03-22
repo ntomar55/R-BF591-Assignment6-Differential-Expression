@@ -15,6 +15,9 @@ for (package in libs) {
   require(package, character.only = T)
 }
 
+library(statmod)
+
+
 #### load and filter ####
 #' Load n' trim
 #'
@@ -33,10 +36,11 @@ for (package in libs) {
 #'
 #' @examples counts_df <- load_n_trim("/path/to/counts/verse_counts.tsv")
 load_n_trim <- function(filename) {
-
-  return()
+  col <- c("vP0_1", "vP0_2", "vAd_1","vAd_2")
+  counts <- read.delim(filename, header=TRUE, sep="\t", row.names = "gene") %>%
+    select(col)
+  return(counts)
 }
-
 #' Perform a DESeq2 analysis of rna seq data
 #'
 #' @param count_dataframe The data frame of gene names and counts.
@@ -58,9 +62,16 @@ load_n_trim <- function(filename) {
 #'
 #' @examples run_deseq(counts_df, coldata, 10, "condition_day4_vs_day7")
 run_deseq <- function(count_dataframe, coldata, count_filter, condition_name) {
-  
-  return()
+  dds <- DESeqDataSetFromMatrix(countData = count_dataframe,
+                                colData = coldata,
+                                design = ~ condition)
+  dds <- DESeq(dds)
+  keep <- rowSums(counts(dds)) >= count_filter
+  dds <- dds[keep,]
+  res <- results(dds, name=condition_name)
+  return(res)
 }
+
 
 #### edgeR ####
 #' Perform an edgeR analysis of RNA seq data
@@ -79,10 +90,20 @@ run_deseq <- function(count_dataframe, coldata, count_filter, condition_name) {
 #'
 #' @examples run_edger(counts_df, group)
 run_edger <- function(count_dataframe, group) {
-  
-  return()
+  y <- DGEList(counts = count_dataframe, group = group)
+  design <- model.matrix(~group)
+  design
+  rownames(design) <- colnames(y)
+  keep <- filterByExpr(y, design)
+  y <- y[keep,,keep.lib.sizes=FALSE]
+  y <- calcNormFactors(y)
+  y <- estimateDisp(y, design, robust=TRUE)
+  et <- exactTest(y)
+  fit <- glmFit(y, design)
+  lrt <- glmLRT(fit)
+  res <- select(lrt$table, logFC, logCPM, PValue)
+  return(res)
 }
-
  #### limma ####
 #' Perform an analysis using Limma, with an mandatory voom component.
 #'
@@ -104,8 +125,15 @@ run_edger <- function(count_dataframe, group) {
 #' 
 #' @examples run_limma(counts_df, design, voom=TRUE)
 run_limma <- function(counts_dataframe, design, group) {
-  
-  return()
+  dge <- DGEList(counts = counts_dataframe)
+  keep <- filterByExpr(dge, design)
+  dge <- dge[keep,,keep.lib.sizes=FALSE]
+  dge <- calcNormFactors(dge)
+  v <- voom(dge, design, plot=TRUE)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+  res <- topTable(fit, coef=ncol(design), number=Inf, resort.by="P")
+  return(res)
 }
 
 #### ggplot ####
@@ -137,8 +165,9 @@ run_limma <- function(counts_dataframe, design, group) {
 #' 2 deseq   9.97e-261
 #' 3 deseq   1.16e-206
 combine_pval <- function(deseq, edger, limma) {
-  
-  return()
+  comb_tbl <- tibble(deseq = deseq$padj, edger = edger$padj, limma = limma$adj.P.Val) %>% 
+    gather(package, pval, deseq, edger, limma)
+  return(comb_tbl)
 }
 
 #' Create three separate facets for each of the diff. exp. pacakges.
@@ -162,8 +191,16 @@ combine_pval <- function(deseq, edger, limma) {
 #' 1  -9.84 2.23e-180 edgeR  
 #' 2   6.18 5.87e-179 edgeR  
 create_facets <- function(deseq, edger, limma) {
-  
-  return()
+  comb_tbl <- tibble(DESeq2.logFC = deseq$log2FoldChange, DESeq2.padj = deseq$padj,
+                     edgeR.logFC = edger$logFC, edgeR.padj = edger$padj,
+                     Limma.logFC = limma$logFC, Limma.padj = limma$adj.P.Val) %>%
+    gather(package, logFC, DESeq2.logFC, edgeR.logFC, Limma.logFC)  %>%
+    gather(package2, padj, DESeq2.padj, edgeR.padj, Limma.padj) %>%
+    filter(substring(package, 1,5) == substring(package2, 1, 5)) %>%
+    select(-package2) %>%
+    mutate(package=substring(package, 1,5)) %>%
+    mutate(package=replace(package, package=="DESeq", "DESeq2"))
+  return(comb_tbl)
 }
 
 #' Create an attractive volcano plot of three diff. exp. packages' data.
@@ -193,6 +230,51 @@ create_facets <- function(deseq, edger, limma) {
 #'
 #' @examples p <- theme_plot(volcano)
 theme_plot <- function(volcano_data) {
-  
-  return()
+  volcano_plot <- volcano_data %>% 
+    ggplot() + 
+    geom_point(mapping=aes(x=logFC, y=-log10(padj), color=case_when(-log10(padj) < 100 ~ 'FALSE', TRUE ~ 'TRUE'))) +
+    facet_wrap(~package) +
+    theme(legend.position = 'bottom', panel.background = element_rect(fill='white'), panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    labs(x=expression(log[2]~fold~{"-"}~change), 
+         y=expression({"-"}~log[10]~(p~adjusted)), color = "P-adj < 1e-100") +
+    ggtitle('Volcano plot comparison of three diff. expression R packages',
+            subtitle = "Comparing dat 0 vs. adult mouse myocardial cells")
+  return(volcano_plot)
+}
+
+combine_pval2 <- function(deseq, edger, voom, limma) {
+  comb_tbl <- tibble(deseq = deseq$padj, edger = edger$padj, voom = voom$adj.P.Val, limma = limma$adj.P.Val) %>% 
+    gather(package, pval, deseq, edger, voom, limma)
+  return(comb_tbl)
+}
+
+
+create_facets2 <- function(deseq, edger, voom, limma) {
+  comb_tbl <- tibble(DESeq2.logFC = deseq$log2FoldChange, DESeq2.padj = deseq$padj,
+                     edgeR.logFC = edger$logFC, edgeR.padj = edger$padj,
+                     Voome.logFC = voom$logFC, Voome.padj = voom$adj.P.Val,
+                     Limma.logFC = limma$logFC, Limma.padj = limma$adj.P.Val) %>%
+    gather(package, logFC, DESeq2.logFC, edgeR.logFC, Voome.logFC, Limma.logFC)  %>%
+    gather(package2, padj, DESeq2.padj, edgeR.padj, Voome.padj, Limma.padj) %>%
+    filter(substring(package, 1,5) == substring(package2, 1, 5)) %>%
+    select(-package2) %>%
+    mutate(package=substring(package, 1,5)) %>%
+    mutate(package=replace(package, package=="DESeq", "DESeq2")) %>%
+    mutate(package=replace(package, package=="Voome", "Voom"))
+  return(comb_tbl)
+}
+
+theme_plot2 <- function(volcano_data) {
+  volcano_plot <- volcano_data %>% 
+    ggplot() + 
+    geom_point(mapping=aes(x=logFC, y=-log10(padj), color=case_when(-log10(padj) < 100 ~ 'FALSE', TRUE ~ 'TRUE'))) +
+    facet_wrap(~package, ncol = 3, nrow = 2) +
+    theme(legend.position = 'bottom', panel.background = element_rect(fill='white'), panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    labs(x=expression(log[2]~fold~{"-"}~change), 
+         y=expression({"-"}~log[10]~(p~adjusted)), color = "P-adj < 1e-100") +
+    ggtitle('Volcano plot comparison of four diff. expression R packages',
+            subtitle = "Comparing dat 0 vs. adult mouse myocardial cells")
+    return(volcano_plot)
 }
